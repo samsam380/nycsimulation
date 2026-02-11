@@ -252,6 +252,8 @@
         <div class="stat"><div class="k">Gov deficit (monthly)</div><div class="v" id="sDef">$0</div></div>
         <div class="stat"><div class="k">Asking vs In-place rent</div><div class="v" id="sRentGap">$0</div></div>
         <div class="stat"><div class="k">Wealth share: top 20%</div><div class="v" id="sTopShare">0%</div></div>
+        <div class="stat"><div class="k">Unemployment (proxy)</div><div class="v" id="sUnemp">0.0%</div></div>
+        <div class="stat"><div class="k">CPI inflation (YoY, proxy)</div><div class="v" id="sCPI">0.0%</div></div>
       </div>
 
       <div class="mini" id="miniQ">
@@ -344,6 +346,11 @@
     cycleShock: 0,        // macro shock
     creVacShock: 0,       // CRE vacancy shock
 
+    // Macro state (for realism)
+    inflationYoY: 0.031,
+    policyRate: 0.053,
+    unemployment: 0.044,
+
     // Sectors (aggregate deposits)
     bank: { loans:0, equity: 4_000_000_000, rwa:0, spread: 0.020 },
     govt:{ deposits: 1_500_000_000, debt: 40_000_000_000 }, // stylized stock
@@ -370,6 +377,30 @@
 
     hist: { labels:[], dep:[], loans:[], bankEq:[], bankCap:[], house:[], ask:[], inpl:[], topShare:[] }
   };
+
+  function payDepositInterest(monthlyRate){
+    if (monthlyRate <= 0) return 0;
+    let paid = 0;
+
+    const payTo = (obj, key="deposits") => {
+      const bal = Math.max(0, obj[key] || 0);
+      if (bal <= 0) return;
+      const i = bal * monthlyRate;
+      obj[key] += i;
+      paid += i;
+    };
+
+    for (const g of S.Q) payTo(g);
+    payTo(S.merchants);
+    payTo(S.developers);
+    payTo(S.landlords);
+    payTo(S.govt);
+    payTo(S.mta);
+    payTo(S.corp);
+
+    S.bank.equity -= paid;
+    return paid;
+  }
 
   function amortPayPerDollar(apr, years=30){
     const r = apr/12;
@@ -480,12 +511,44 @@
     const shock = 1 + S.cycleShock;
     const wageDrop = 1 - S.recessionSeverity * clamp(-S.cycleShock, 0, 0.6);
 
+    // Monetary + labor regime (simple macro closure)
+    const capShort = clamp((S.capTarget - capRatio)/S.capTarget, 0, 1);
+    const outputGap = clamp(S.cycleShock - 0.45*capShort, -0.8, 0.8);
+    const uStar = 0.046;
+    const uShock = clamp(0.020*(-outputGap) + 0.012*S.recessionSeverity*clamp(-S.cycleShock,0,1), -0.01, 0.03);
+    S.unemployment = clamp(0.86*S.unemployment + 0.14*(uStar + uShock), 0.028, 0.19);
+
+    const monthlyInfl = S.inflationYoY/12;
+    const demandPressure = clamp(outputGap, -0.7, 0.7);
+    const wagePressure = clamp((uStar - S.unemployment)*6.5, -0.5, 0.5);
+    const rentPressureNow = clamp(S.askingRent / Math.max(1,S.inPlaceRent) - 1, 0, 1.2);
+    const nextMonthlyInfl = clamp(
+      0.68*monthlyInfl + 0.0017 + 0.0014*demandPressure + 0.0012*wagePressure + 0.0007*rentPressureNow,
+      -0.004,
+      0.015
+    );
+    S.inflationYoY = clamp(nextMonthlyInfl*12, -0.02, 0.11);
+
+    // Policy rule (Taylor-like) and pass-through to mortgage rate
+    const inflGap = S.inflationYoY - 0.02;
+    const uGap = S.unemployment - uStar;
+    const neutral = 0.022;
+    const targetPolicy = clamp(neutral + 1.3*inflGap - 0.7*uGap, 0.0, 0.10);
+    S.policyRate = clamp(0.90*S.policyRate + 0.10*targetPolicy, 0.0, 0.11);
+    const baseMortgage = +$("rate").value/10000;
+    S.mortgageAPR = clamp(0.86*S.mortgageAPR + 0.14*(baseMortgage + 0.58*(S.policyRate - 0.03)), 0.01, 0.14);
+
+    // Deposit interest pass-through (banks pay on deposits; rises with policy rate)
+    const depositAPR = clamp(0.001 + 0.40*S.policyRate, 0.001, 0.055);
+    const depInterestPaid = payDepositInterest(depositAPR/12);
+
     // -------------------------
     // 1) WAGES (private) — merchants + corp pay households
     // -------------------------
     let wageBill = 0;
     for (const g of S.Q){
-      const incomeM = (g.income/12) * shock * wageDrop;
+      const laborHit = clamp(1 - 1.65*S.unemployment, 0.60, 0.98);
+      const incomeM = (g.income/12) * shock * wageDrop * laborHit;
       const pay = g.hh * incomeM * scale;
       wageBill += pay;
 
@@ -604,12 +667,13 @@
       0.0010
       + 0.0020*clamp(S.cycleShock,0,0.4)
       - 0.0030*clamp(-S.cycleShock,0,0.6)
+      - 0.0020*clamp(S.unemployment - 0.055, 0, 0.10)
       + 0.0012*clamp(S.askingRent / Math.max(1,S.inPlaceRent) - 1, 0, 2);
 
     S.askingRent *= clamp(1 + askGrowth, 0.985, 1.030);
 
     // In-place converges: inPlace += turnover*(asking - inPlace)*k
-    const conv = clamp(S.turnoverMonthly * 0.55, 0.002, 0.03);
+    const conv = clamp(S.turnoverMonthly * (0.45 + 0.9*S.unemployment), 0.002, 0.04);
     S.inPlaceRent = S.inPlaceRent + conv*(S.askingRent - S.inPlaceRent);
 
     let rentFlow = 0;
@@ -634,7 +698,7 @@
     // -------------------------
     let spending = 0;
     for (const g of S.Q){
-      const spendRate = clamp(g.spend - 0.10*clamp(-S.cycleShock,0,1), 0.18, 0.75);
+      const spendRate = clamp(g.spend - 0.10*clamp(-S.cycleShock,0,1) - 0.08*clamp(S.unemployment - 0.05, 0, 0.10), 0.14, 0.75);
 
       // buffer: 1.5 months of in-place rent
       const buffer = (g.hh * g.rentersShare) * (S.inPlaceRent) * scale * 1.5;
@@ -712,8 +776,9 @@
     const payPerDollar = amortPayPerDollar(S.mortgageAPR + S.bank.spread, 30);
     // DTI tightens when cap shortfall or recession
     const cap = S.bank.equity / S.bank.rwa;
-    const capShort = clamp((S.capTarget - cap)/S.capTarget, 0, 1);
-    const dti = clamp(S.dtiBase * (1 - 0.25*capShort) * (1 - 0.15*recStress), 0.18, 0.55);
+    // capShort already computed in macro block
+    const capShortForDTI = clamp((S.capTarget - cap)/S.capTarget, 0, 1);
+    const dti = clamp(S.dtiBase * (1 - 0.25*capShortForDTI) * (1 - 0.15*recStress), 0.18, 0.55);
 
     // also mortgage access tightens when cap short
     const accessMul = clamp(tightMul * (1 - 0.35*recStress), 0.18, 1.05);
@@ -735,7 +800,7 @@
         attempts = Math.floor(attempts * clamp(maxPayment / paymentForMedian, 0, 1));
       }
 
-      const dpRate = 0.10 + 0.10*capShort + 0.06*recStress; // dp requirement rises in stress
+      const dpRate = 0.10 + 0.10*capShortForDTI + 0.06*recStress; // dp requirement rises in stress
       const dp = S.housePrice * dpRate;
 
       const avgDepositsPerHH = (g.deposits / Math.max(1, g.hh)) / scale;
@@ -949,6 +1014,9 @@
     S.flows.principalCRE = pCRE;
     S.flows.defaultsCRE = dCRE;
 
+    // deposit interest acts as reverse extraction to deposit holders
+    S.flows.interestHH = iHH - depInterestPaid*0.72;
+
     // -------------------------
     // 10) Housing price dynamics: credit impulse + rent pressure + recession
     // -------------------------
@@ -1084,9 +1152,11 @@
     $("sDef").textContent = fmt(S.flows.bondIssue - Math.max(0,S.flows.taxes - S.flows.transfers)); // rough signal
     $("sRentGap").textContent = `${fmt(S.askingRent)} / ${fmt(S.inPlaceRent)} (Δ ${fmt(gap)})`;
     $("sTopShare").textContent = topShare.toFixed(1) + "%";
+    $("sUnemp").textContent = (S.unemployment*100).toFixed(1) + "%";
+    $("sCPI").textContent = (S.inflationYoY*100).toFixed(1) + "%";
 
     $("statusPill").textContent =
-      `t=${S.t} months • ${S.paused ? "paused" : "running"} • house=${fmt(S.housePrice)} • askRent=${fmt(S.askingRent)} • cap=${cap.toFixed(2)}% • spread=${(S.bank.spread*100).toFixed(2)}% • vacancy=${(S.corp.vacancy*100).toFixed(1)}%`;
+      `t=${S.t} months • ${S.paused ? "paused" : "running"} • house=${fmt(S.housePrice)} • askRent=${fmt(S.askingRent)} • cap=${cap.toFixed(2)}% • spread=${(S.bank.spread*100).toFixed(2)}% • vacancy=${(S.corp.vacancy*100).toFixed(1)}% • U=${(S.unemployment*100).toFixed(1)}% • CPI=${(S.inflationYoY*100).toFixed(1)}%`;
   }
 
   // ---------- Charts ----------
@@ -1324,6 +1394,7 @@
   function resetAll(){
     pause();
     S.t=0; S.cycleShock=0; S.creVacShock=0;
+    S.inflationYoY=0.031; S.policyRate=0.053; S.unemployment=0.044;
 
     S.bank = { loans:0, equity: 4_000_000_000, rwa:0, spread: 0.020 };
     S.govt = { deposits: 1_500_000_000, debt: 40_000_000_000 };
